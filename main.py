@@ -8,7 +8,7 @@ import time
 import random
 import threading
 
-ADDR = "0.0.0.0"
+ADDR = "0.0.0.0"  # Bind to all interfaces for Render
 PORT = 8000
 MAX_PLAYERS = 20
 MSG_SIZE = 2048
@@ -22,17 +22,7 @@ players = {}
 
 
 def generate_id(player_list: dict, max_players: int):
-    """
-    Generate a unique identifier
-
-    Args:
-        player_list (dict): dictionary of existing players
-        max_players (int): maximum number of players allowed
-
-    Returns:
-        str: the unique identifier
-    """
-
+    """Generate a unique identifier"""
     while True:
         unique_id = str(random.randint(1, max_players))
         if unique_id not in player_list:
@@ -55,6 +45,12 @@ def handle_messages(identifier: str):
 
         msg_decoded = msg.decode("utf8")
 
+        # ✅ Ignore Render's HTTP health checks
+        if msg_decoded.startswith("HEAD /") or msg_decoded.startswith("GET /"):
+            print("🔸 Ignored Render health check request")
+            conn.close()
+            return
+
         try:
             left_bracket_index = msg_decoded.index("{")
             right_bracket_index = msg_decoded.index("}") + 1
@@ -76,7 +72,7 @@ def handle_messages(identifier: str):
             players[identifier]["health"] = msg_json["health"]
 
         # Tell other players about player moving
-        for player_id in players:
+        for player_id in list(players.keys()):
             if player_id != identifier:
                 player_info = players[player_id]
                 player_conn: socket.socket = player_info["socket"]
@@ -85,13 +81,18 @@ def handle_messages(identifier: str):
                 except OSError:
                     pass
 
-    # Tell other players about player leaving
-    for player_id in players:
+    # Tell others about the player leaving
+    for player_id in list(players.keys()):
         if player_id != identifier:
             player_info = players[player_id]
             player_conn: socket.socket = player_info["socket"]
             try:
-                player_conn.send(json.dumps({"id": identifier, "object": "player", "joined": False, "left": True}).encode("utf8"))
+                player_conn.send(json.dumps({
+                    "id": identifier,
+                    "object": "player",
+                    "joined": False,
+                    "left": True
+                }).encode("utf8"))
             except OSError:
                 pass
 
@@ -101,17 +102,30 @@ def handle_messages(identifier: str):
 
 
 def main():
-    print("Server started, listening for new connections...")
+    print(f"✅ Server started on {ADDR}:{PORT}, waiting for players...")
 
     while True:
-        # Accept new connection and assign unique ID
         conn, addr = s.accept()
+
+        # ✅ Handle Render health checks before assigning IDs
+        try:
+            conn.settimeout(0.5)
+            probe = conn.recv(128).decode("utf-8", errors="ignore")
+            if probe.startswith("HEAD /") or probe.startswith("GET /"):
+                print("🔸 Ignored Render probe from", addr)
+                conn.close()
+                continue
+        except Exception:
+            pass
+        finally:
+            conn.settimeout(None)
+
         new_id = generate_id(players, MAX_PLAYERS)
         conn.send(new_id.encode("utf8"))
         username = conn.recv(MSG_SIZE).decode("utf8")
         new_player_info = {"socket": conn, "username": username, "position": (0, 1, 0), "rotation": 0, "health": 100}
 
-        # Tell existing players about new player
+        # Notify existing players about the new player
         for player_id in players:
             if player_id != new_id:
                 player_info = players[player_id]
@@ -129,7 +143,7 @@ def main():
                 except OSError:
                     pass
 
-        # Tell new player about existing players
+        # Notify the new player about all existing ones
         for player_id in players:
             if player_id != new_id:
                 player_info = players[player_id]
@@ -147,23 +161,18 @@ def main():
                 except OSError:
                     pass
 
-        # Add new player to players list, effectively allowing it to receive messages from other players
+        # Add player to the active list
         players[new_id] = new_player_info
 
-        # Start thread to receive messages from client
-        msg_thread = threading.Thread(target=handle_messages, args=(new_id,), daemon=True)
-        msg_thread.start()
-
-        print(f"New connection from {addr}, assigned ID: {new_id}...")
+        # Start message thread
+        threading.Thread(target=handle_messages, args=(new_id,), daemon=True).start()
+        print(f"🎮 New connection from {addr}, assigned ID: {new_id}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        pass
-    except SystemExit:
-        pass
+        print("Server shutting down gracefully...")
     finally:
-        print("Exiting")
         s.close()
