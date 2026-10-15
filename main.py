@@ -1,13 +1,17 @@
 """TCP server for multiplayer state, pickups, purchases, and match stats."""
 
 import json
+import os
 import random
+import sqlite3
 import socket
 import threading
 import time
 import uuid
+from contextlib import closing
 
-ADDR = "localhost"
+ADDR = "0.0.0.0"  # was "localhost"
+
 PORT = 8000
 MAX_PLAYERS = 20
 MSG_SIZE = 2048
@@ -15,7 +19,7 @@ AMMO_COUNTDOWN = 60
 MED_COUNTDOWN = 120
 CASH_SPAWN_INTERVAL = 45
 CASH_LOOT_LIMIT = 12
-MAP_BOUNDS = (-74, 74)
+MAP_BOUNDS = (-110, 110)
 STARTING_CASH = 100
 KILL_REWARD = 50
 VENDING_MACHINE_POSITION = (16, 4.2, -16)
@@ -36,6 +40,76 @@ players = {}
 world_voxels = set()
 cash_loot = {}
 state_lock = threading.RLock()
+profile_lock = threading.Lock()
+PROFILE_DATABASE = os.path.join(os.path.dirname(__file__), "profiles.sqlite3")
+
+
+def initialize_profiles():
+    with profile_lock, closing(sqlite3.connect(PROFILE_DATABASE)) as database:
+        with database:
+            database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS profiles (
+                    username_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    kills INTEGER NOT NULL DEFAULT 0,
+                    deaths INTEGER NOT NULL DEFAULT 0,
+                    matches INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+
+def load_profile(username):
+    username_key = username.casefold()
+    with profile_lock, closing(sqlite3.connect(PROFILE_DATABASE)) as database:
+        with database:
+            database.execute(
+                """
+                INSERT INTO profiles (username_key, username, matches)
+                VALUES (?, ?, 1)
+                ON CONFLICT(username_key) DO UPDATE SET
+                    username = excluded.username,
+                    matches = profiles.matches + 1
+                """,
+                (username_key, username),
+            )
+    return profile_data(username)
+
+
+def profile_data(username):
+    with profile_lock, closing(sqlite3.connect(PROFILE_DATABASE)) as database:
+        row = database.execute(
+            """
+            SELECT username, kills, deaths, matches
+            FROM profiles
+            WHERE username_key = ?
+            """,
+            (username.casefold(),),
+        ).fetchone()
+    if row is None:
+        raise LookupError(f"Profile not found for {username!r}.")
+    return {
+        "username": row[0],
+        "kills": row[1],
+        "deaths": row[2],
+        "matches": row[3],
+        "kd": row[1] / row[2] if row[2] else float(row[1]),
+    }
+
+
+def record_profile_result(attacker_username, victim_username):
+    with profile_lock, closing(sqlite3.connect(PROFILE_DATABASE)) as database:
+        with database:
+            if attacker_username is not None:
+                database.execute(
+                    "UPDATE profiles SET kills = kills + 1 WHERE username_key = ?",
+                    (attacker_username.casefold(),),
+                )
+            database.execute(
+                "UPDATE profiles SET deaths = deaths + 1 WHERE username_key = ?",
+                (victim_username.casefold(),),
+            )
 
 
 def send_json(conn, data, send_lock=None):
@@ -194,6 +268,10 @@ def process_health_update(attacker_id, message):
             and not target["death_recorded"]
         )
         if killed:
+            record_profile_result(
+                attacker["username"] if attacker_id != target_id else None,
+                target["username"],
+            )
             target["death_recorded"] = True
             target["deaths"] += 1
             if attacker_id != target_id:
@@ -214,6 +292,14 @@ def process_health_update(attacker_id, message):
                 "cash": attacker["cash"],
                 "message": f"Kill reward: +${KILL_REWARD}",
             })
+            send_to_player(attacker_id, {
+                "object": "profile",
+                "profile": profile_data(attacker["username"]),
+            })
+        send_to_player(target_id, {
+            "object": "profile",
+            "profile": profile_data(target["username"]),
+        })
         broadcast_leaderboard()
 
 
@@ -426,8 +512,9 @@ def player_message(identifier, player, joined, left=False):
 
 
 def main():
+    initialize_profiles()
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # add this
     server_socket.bind((ADDR, PORT))
     server_socket.listen(MAX_PLAYERS)
     print(f"Server listening on {ADDR}:{PORT}...")
@@ -450,6 +537,7 @@ def main():
                 username = conn.recv(MSG_SIZE).decode("utf8").strip()[:32]
                 if not username:
                     username = f"Player {identifier}"
+                profile = load_profile(username)
 
                 player = {
                     "socket": conn,
@@ -464,6 +552,7 @@ def main():
                     "cash": STARTING_CASH,
                     "kills": 0,
                     "deaths": 0,
+                    "profile": profile,
                 }
                 with state_lock:
                     existing_players = [
@@ -483,6 +572,10 @@ def main():
                     "cash": player["cash"],
                     "kills": player["kills"],
                     "deaths": player["deaths"],
+                }, player["send_lock"])
+                send_json(conn, {
+                    "object": "profile",
+                    "profile": profile,
                 }, player["send_lock"])
                 send_json(conn, {
                     "object": "shop_catalog",

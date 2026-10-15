@@ -1,0 +1,11 @@
+app = "Glitch"
+primary_region = "jnb"  # London — pick closest to your players
+
+[build]
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8000
+
+  [[services.ports]]
+    port = 8000
