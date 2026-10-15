@@ -1,4 +1,4 @@
-app = "Glitch"
+app = "glitch"
 primary_region = "jnb"  # London — pick closest to your players
 
 [build]
