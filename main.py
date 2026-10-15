@@ -1,213 +1,520 @@
-"""
-Glitch Multiplayer Server
-Handles player connections, synchronization, and messaging.
-"""
+"""TCP server for multiplayer state, pickups, purchases, and match stats."""
 
-import socket
 import json
-import time
 import random
+import socket
 import threading
-import errno
+import time
+import uuid
 
-# Server configuration
-ADDR = "0.0.0.0"       # Listen on all interfaces for Render
-PORT = 8000            # Render requires open HTTP/TCP port
+ADDR = "localhost"
+PORT = 8000
 MAX_PLAYERS = 20
 MSG_SIZE = 2048
+AMMO_COUNTDOWN = 60
+MED_COUNTDOWN = 120
+CASH_SPAWN_INTERVAL = 45
+CASH_LOOT_LIMIT = 12
+MAP_BOUNDS = (-74, 74)
+STARTING_CASH = 100
+KILL_REWARD = 50
+VENDING_MACHINE_POSITION = (16, 4.2, -16)
+VENDING_MACHINE_DISTANCE = 5
+CASH_PICKUP_DISTANCE = 4
 
-# Initialize server socket
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+SHOP_CATALOG = {
+    "ammo_smg": {"label": "SMG ammo (+80)", "price": 25, "ammo_type": "smg", "amount": 80},
+    "ammo_grenade": {"label": "Grenades (+3)", "price": 40, "ammo_type": "grenade", "amount": 3},
+    "ammo_knife": {"label": "Throwing knives (+5)", "price": 20, "ammo_type": "knife", "amount": 5},
+    "ammo_arrow": {"label": "Arrows (+10)", "price": 30, "ammo_type": "arrow", "amount": 10},
+    "ammo_shield": {"label": "Shield charges (+2)", "price": 60, "ammo_type": "shield", "amount": 2},
+    "ammo_sniper": {"label": "Sniper ammo (+5)", "price": 50, "ammo_type": "sniper", "amount": 5},
+    "health": {"label": "Health (+60)", "price": 40, "amount": 60},
+}
 
 players = {}
+world_voxels = set()
+cash_loot = {}
+state_lock = threading.RLock()
 
 
-def generate_id(player_list: dict, max_players: int):
-    """Generate a unique player ID."""
+def send_json(conn, data, send_lock=None):
+    payload = (json.dumps(data) + "\n").encode("utf8")
+    if send_lock is None:
+        conn.sendall(payload)
+        return
+    with send_lock:
+        conn.sendall(payload)
+
+
+def send_to_player(identifier, data):
+    with state_lock:
+        player = players.get(identifier)
+    if player is None:
+        return False
+    try:
+        send_json(player["socket"], data, player["send_lock"])
+        return True
+    except OSError as error:
+        print(f"Could not send message to player {identifier}: {error}")
+        return False
+
+
+def broadcast(data, exclude=None):
+    with state_lock:
+        recipients = [
+            (identifier, player["socket"], player["send_lock"])
+            for identifier, player in players.items()
+            if identifier != exclude
+        ]
+    for identifier, conn, send_lock in recipients:
+        try:
+            send_json(conn, data, send_lock)
+        except OSError as error:
+            print(f"Could not send message to player {identifier}: {error}")
+
+
+def leaderboard_data():
+    with state_lock:
+        rows = [
+            {
+                "id": identifier,
+                "username": player["username"],
+                "kills": player["kills"],
+                "deaths": player["deaths"],
+                "kd": (
+                    player["kills"] / player["deaths"]
+                    if player["deaths"]
+                    else float(player["kills"])
+                ),
+            }
+            for identifier, player in players.items()
+        ]
+    rows.sort(key=lambda row: (-row["kd"], -row["kills"], row["username"].casefold()))
+    return {"object": "leaderboard", "players": rows}
+
+
+def broadcast_leaderboard():
+    broadcast(leaderboard_data())
+
+
+def send_countdowns(object_name, duration):
+    for seconds in range(duration, 0, -1):
+        broadcast({"object": object_name, "time": seconds})
+        time.sleep(1)
+
+
+def ammo_spawner():
     while True:
-        unique_id = str(random.randint(1, max_players))
-        if unique_id not in player_list:
-            return unique_id
+        send_countdowns("ammo_countdown", AMMO_COUNTDOWN)
+        broadcast({
+            "object": "ammo",
+            "position": (
+                random.randint(*MAP_BOUNDS),
+                1,
+                random.randint(*MAP_BOUNDS),
+            ),
+            "ammo": random.randint(20, 30),
+            "type": random.choice(["smg", "grenade", "sniper", "arrow", "shield", "knife"]),
+        })
+        time.sleep(AMMO_COUNTDOWN)
 
 
-def handle_messages(identifier: str):
-    """Handle incoming player messages and broadcast to others."""
-    client_info = players[identifier]
-    conn: socket.socket = client_info["socket"]
-    username = client_info["username"]
-
+def medkit_spawner():
     while True:
+        send_countdowns("med_countdown", MED_COUNTDOWN)
+        broadcast({
+            "object": "med",
+            "position": (
+                random.randint(*MAP_BOUNDS),
+                1,
+                random.randint(*MAP_BOUNDS),
+            ),
+            "hp": random.choice([4, 5]),
+        })
+        time.sleep(MED_COUNTDOWN)
+
+
+def cash_spawner():
+    while True:
+        time.sleep(CASH_SPAWN_INTERVAL)
+        pickup = {
+            "object": "cash",
+            "id": uuid.uuid4().hex,
+            "position": (
+                random.randint(*MAP_BOUNDS),
+                1,
+                random.randint(*MAP_BOUNDS),
+            ),
+            "amount": random.randint(25, 75),
+        }
+        with state_lock:
+            expired_ids = []
+            while len(cash_loot) >= CASH_LOOT_LIMIT:
+                expired_id = next(iter(cash_loot))
+                del cash_loot[expired_id]
+                expired_ids.append(expired_id)
+            cash_loot[pickup["id"]] = pickup
+        for expired_id in expired_ids:
+            broadcast({"object": "cash_removed", "id": expired_id})
+        broadcast(pickup)
+
+
+def generate_id(player_list, max_players):
+    available_ids = set(map(str, range(1, max_players + 1)))
+    available_ids.difference_update(player_list)
+    return random.choice(tuple(available_ids)) if available_ids else None
+
+
+def distance_squared(first, second, axes=(0, 1, 2)):
+    try:
+        return sum((float(first[index]) - float(second[index])) ** 2 for index in axes)
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def process_health_update(attacker_id, message):
+    target_id = str(message.get("id", ""))
+    try:
+        reported_health = max(0, min(200, int(message["health"])))
+    except (KeyError, TypeError, ValueError):
+        return
+
+    with state_lock:
+        target = players.get(target_id)
+        attacker = players.get(attacker_id)
+        if target is None or attacker is None:
+            return
+
+        previous_health = target["health"]
+        target["health"] = min(previous_health, reported_health)
+        killed = (
+            previous_health > 0
+            and target["health"] == 0
+            and not target["death_recorded"]
+        )
+        if killed:
+            target["death_recorded"] = True
+            target["deaths"] += 1
+            if attacker_id != target_id:
+                attacker["kills"] += 1
+                attacker["cash"] += KILL_REWARD
+            else:
+                attacker = None
+
+    broadcast({
+        "object": "health_update",
+        "id": target_id,
+        "health": target["health"],
+    })
+    if killed:
+        if attacker is not None:
+            send_to_player(attacker_id, {
+                "object": "cash_balance",
+                "cash": attacker["cash"],
+                "message": f"Kill reward: +${KILL_REWARD}",
+            })
+        broadcast_leaderboard()
+
+
+def process_cash_pickup(identifier, message):
+    pickup_id = message.get("id")
+    with state_lock:
+        pickup = cash_loot.get(pickup_id)
+        player = players.get(identifier)
+        pickup_is_near = (
+            player is not None
+            and pickup is not None
+            and distance_squared(
+                player["position"],
+                pickup["position"],
+            ) <= CASH_PICKUP_DISTANCE ** 2
+        )
+        if not pickup_is_near:
+            accepted = False
+            balance = player["cash"] if player else 0
+            amount = 0
+        else:
+            cash_loot.pop(pickup_id)
+            accepted = True
+            amount = pickup["amount"]
+            player["cash"] += amount
+            balance = player["cash"]
+
+    if accepted:
+        broadcast({"object": "cash_removed", "id": pickup_id})
+    send_to_player(identifier, {
+        "object": "cash_pickup_result",
+        "id": pickup_id,
+        "accepted": accepted,
+        "cash": balance,
+        "amount": amount,
+    })
+
+
+def process_purchase(identifier, message):
+    item_key = message.get("item")
+    item = SHOP_CATALOG.get(item_key)
+    with state_lock:
+        player = players.get(identifier)
+        if player is None:
+            return
+
+        accepted = item is not None
+        message_text = "Purchase complete."
+        amount = 0
+        ammo_type = None
+        health_gain = 0
+
+        machine_distance = distance_squared(
+            player["position"],
+            VENDING_MACHINE_POSITION,
+            axes=(0, 2),
+        )
+        if machine_distance is None or machine_distance > VENDING_MACHINE_DISTANCE ** 2:
+            accepted = False
+            message_text = "Move closer to the vending machine."
+        elif item is None:
+            message_text = "That item is not available."
+        elif player["cash"] < item["price"]:
+            accepted = False
+            message_text = "Not enough cash."
+        elif item_key == "health" and (
+            player["health"] >= 200 or player["death_recorded"]
+        ):
+            accepted = False
+            message_text = "Health is full or the player is dead."
+        else:
+            player["cash"] -= item["price"]
+            amount = item["amount"]
+            ammo_type = item.get("ammo_type")
+            if item_key == "health":
+                health_gain = min(amount, 200 - player["health"])
+                player["health"] += health_gain
+                amount = health_gain
+                message_text = f"Health restored by {health_gain}."
+
+        result = {
+            "object": "purchase_result",
+            "accepted": accepted,
+            "item": item_key,
+            "message": message_text,
+            "cash": player["cash"],
+            "ammo_type": ammo_type,
+            "amount": amount,
+            "health": player["health"],
+        }
+    send_to_player(identifier, result)
+
+
+def handle_message(identifier, message):
+    if not isinstance(message, dict):
+        return
+
+    object_type = message.get("object")
+    if object_type == "player":
+        with state_lock:
+            player = players.get(identifier)
+            if player is None:
+                return
+            player["position"] = message.get("position", player["position"])
+            player["rotation"] = message.get("rotation", player["rotation"])
+            reported_health = max(
+                0,
+                min(200, int(message.get("health", player["health"]))),
+            )
+            player["health"] = (
+                0 if player["death_recorded"] else reported_health
+            )
+            player["weapon"] = message.get("weapon", player["weapon"])
+            player["shielded"] = bool(message.get("shielded", player["shielded"]))
+            message = {**message, "health": player["health"]}
+        broadcast(message, exclude=identifier)
+    elif object_type == "health_update":
+        process_health_update(identifier, message)
+    elif object_type in {"bullet", "sniper_bullet", "grenade", "knife", "arrow"}:
+        broadcast(message, exclude=identifier)
+    elif object_type == "cash_pickup":
+        process_cash_pickup(identifier, message)
+    elif object_type == "shop_purchase":
+        process_purchase(identifier, message)
+    elif object_type == "chat":
+        with state_lock:
+            player = players.get(identifier)
+            username = player["username"] if player else "Unknown"
+        broadcast({
+            "object": "chat",
+            "username": username,
+            "message": str(message.get("message", ""))[:500],
+        })
+    elif object_type == "voxel":
         try:
-            msg = conn.recv(MSG_SIZE)
-        except ConnectionResetError:
-            break
+            position = tuple(message["position"])
+        except (KeyError, TypeError):
+            return
+        if message.get("action") == "place":
+            with state_lock:
+                world_voxels.add(position)
+        elif message.get("action") == "destroy":
+            with state_lock:
+                world_voxels.discard(position)
+        else:
+            return
+        broadcast(message, exclude=identifier)
 
-        if not msg:
-            break
 
-        msg_decoded = msg.decode("utf8")
+def handle_messages(identifier):
+    with state_lock:
+        client_info = players.get(identifier)
+    if client_info is None:
+        return
 
-        try:
-            left_bracket_index = msg_decoded.index("{")
-            right_bracket_index = msg_decoded.index("}") + 1
-            msg_decoded = msg_decoded[left_bracket_index:right_bracket_index]
-        except ValueError:
-            continue
-
-        try:
-            msg_json = json.loads(msg_decoded)
-        except Exception as e:
-            print("⚠️ JSON parse error:", e)
-            continue
-
-        print(f"📩 Received update from {username} (ID {identifier})")
-
-        # Update player info
-        if msg_json.get("object") == "player":
-            players[identifier]["position"] = msg_json.get("position", (0, 0, 0))
-            players[identifier]["rotation"] = msg_json.get("rotation", 0)
-            players[identifier]["health"] = msg_json.get("health", 100)
-
-        # Broadcast to others
-        for pid, info in players.items():
-            if pid != identifier:
+    conn = client_info["socket"]
+    buffer = bytearray()
+    try:
+        while True:
+            chunk = conn.recv(MSG_SIZE)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if len(buffer) > 1024 * 1024:
+                raise ValueError("Client message buffer exceeded 1 MiB.")
+            while b"\n" in buffer:
+                raw_message, _, remainder = buffer.partition(b"\n")
+                buffer = bytearray(remainder)
+                if not raw_message:
+                    continue
                 try:
-                    info["socket"].sendall(msg_decoded.encode("utf8"))
-                except OSError:
-                    pass
+                    message = json.loads(raw_message.decode("utf8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    print(f"Invalid message from player {identifier}: {error}")
+                    continue
+                handle_message(identifier, message)
+    except (ConnectionResetError, OSError) as error:
+        print(f"Connection to player {identifier} closed: {error}")
+    except ValueError as error:
+        print(f"Connection to player {identifier} rejected: {error}")
+    finally:
+        with state_lock:
+            player = players.pop(identifier, None)
+        if player is not None:
+            broadcast({
+                "id": identifier,
+                "object": "player",
+                "username": player["username"],
+                "joined": False,
+                "left": True,
+            }, exclude=identifier)
+            broadcast_leaderboard()
+            conn.close()
+            print(f"Player {player['username']} with ID {identifier} has left.")
 
-    # Notify others that player left
-    for pid, info in players.items():
-        if pid != identifier:
-            try:
-                info["socket"].send(json.dumps({
-                    "id": identifier,
-                    "object": "player",
-                    "joined": False,
-                    "left": True
-                }).encode("utf8"))
-            except OSError:
-                pass
 
-    print(f"👋 Player {username} (ID {identifier}) disconnected.")
-    del players[identifier]
-    conn.close()
+def player_message(identifier, player, joined, left=False):
+    return {
+        "id": identifier,
+        "object": "player",
+        "username": player["username"],
+        "position": player["position"],
+        "rotation": player["rotation"],
+        "health": player["health"],
+        "weapon": player["weapon"],
+        "shielded": player["shielded"],
+        "joined": joined,
+        "left": left,
+    }
 
 
 def main():
-    """Start the game server."""
-    print("🚀 Launching Glitch Multiplayer Server...")
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((ADDR, PORT))
+    server_socket.listen(MAX_PLAYERS)
+    print(f"Server listening on {ADDR}:{PORT}...")
 
-    # Retry binding if port is already in use
-    while True:
-        try:
-            s.bind((ADDR, PORT))
-            break
-        except OSError as e:
-            if e.errno == errno.EADDRINUSE:
-                print(f"⚠️ Port {PORT} already in use. Retrying in 3s...")
-                time.sleep(3)
-            else:
-                raise e
-
-    s.listen(MAX_PLAYERS)
-    print(f"✅ Server started on {ADDR}:{PORT}, waiting for players...")
+    threading.Thread(target=ammo_spawner, daemon=True).start()
+    threading.Thread(target=medkit_spawner, daemon=True).start()
+    threading.Thread(target=cash_spawner, daemon=True).start()
 
     try:
         while True:
+            conn, address = server_socket.accept()
             try:
-                conn, addr = s.accept()
-            except KeyboardInterrupt:
-                print("🛑 Server manually stopped.")
-                break
-
-            # Detect and ignore Render's internal HTTP health probes
-            conn.settimeout(2.0)
-            try:
-                peek_data = conn.recv(64, socket.MSG_PEEK).decode("utf-8", errors="ignore")
-                if peek_data.startswith("HEAD /") or peek_data.startswith("GET /"):
-                    print(f"🔸 Ignored Render probe from {addr}")
+                with state_lock:
+                    identifier = generate_id(players, MAX_PLAYERS)
+                if identifier is None:
                     conn.close()
                     continue
-            except Exception:
-                pass
 
-            conn.settimeout(None)
+                send_json(conn, {"object": "welcome", "id": identifier})
+                username = conn.recv(MSG_SIZE).decode("utf8").strip()[:32]
+                if not username:
+                    username = f"Player {identifier}"
 
-            # Assign unique ID to player
-            new_id = generate_id(players, MAX_PLAYERS)
-            try:
-                conn.send(new_id.encode("utf8"))
-            except Exception:
+                player = {
+                    "socket": conn,
+                    "send_lock": threading.Lock(),
+                    "username": username,
+                    "position": (0, 1, 0),
+                    "rotation": 0,
+                    "health": 200,
+                    "death_recorded": False,
+                    "weapon": "medieval-sword/textures/wire_135059008_albedo.jpeg",
+                    "shielded": False,
+                    "cash": STARTING_CASH,
+                    "kills": 0,
+                    "deaths": 0,
+                }
+                with state_lock:
+                    existing_players = [
+                        (player_id, current)
+                        for player_id, current in players.items()
+                    ]
+                    players[identifier] = player
+                    existing_loot = list(cash_loot.values())
+                    existing_voxels = list(world_voxels)
+
+                for player_id, current in existing_players:
+                    send_to_player(player_id, player_message(identifier, player, True))
+                    send_json(conn, player_message(player_id, current, True), player["send_lock"])
+
+                send_json(conn, {
+                    "object": "player_state",
+                    "cash": player["cash"],
+                    "kills": player["kills"],
+                    "deaths": player["deaths"],
+                }, player["send_lock"])
+                send_json(conn, {
+                    "object": "shop_catalog",
+                    "items": [
+                        {"key": key, **item}
+                        for key, item in SHOP_CATALOG.items()
+                    ],
+                }, player["send_lock"])
+                for pickup in existing_loot:
+                    send_json(conn, pickup, player["send_lock"])
+                for position in existing_voxels:
+                    send_json(conn, {
+                        "object": "voxel",
+                        "action": "place",
+                        "position": position,
+                    }, player["send_lock"])
+
+                threading.Thread(
+                    target=handle_messages,
+                    args=(identifier,),
+                    daemon=True,
+                ).start()
+                broadcast_leaderboard()
+                print(f"New connection from {address}, assigned ID {identifier}.")
+            except (OSError, UnicodeDecodeError) as error:
+                print(f"Could not initialize connection from {address}: {error}")
                 conn.close()
-                continue
-
-            try:
-                username = conn.recv(MSG_SIZE).decode("utf8")
-            except Exception:
-                conn.close()
-                continue
-
-            new_player = {
-                "socket": conn,
-                "username": username,
-                "position": (0, 1, 0),
-                "rotation": 0,
-                "health": 100
-            }
-
-            players[new_id] = new_player
-            print(f"🎮 New connection from {addr}, ID: {new_id}, user: {username}")
-
-            # Inform others about new player
-            for pid, info in players.items():
-                if pid != new_id:
-                    try:
-                        info["socket"].send(json.dumps({
-                            "id": new_id,
-                            "object": "player",
-                            "username": username,
-                            "position": new_player["position"],
-                            "health": new_player["health"],
-                            "joined": True,
-                            "left": False
-                        }).encode("utf8"))
-                    except OSError:
-                        pass
-
-            # Inform new player about others
-            for pid, info in players.items():
-                if pid != new_id:
-                    try:
-                        conn.send(json.dumps({
-                            "id": pid,
-                            "object": "player",
-                            "username": info["username"],
-                            "position": info["position"],
-                            "health": info["health"],
-                            "joined": True,
-                            "left": False
-                        }).encode("utf8"))
-                        time.sleep(0.1)
-                    except OSError:
-                        pass
-
-            # Start message thread
-            threading.Thread(target=handle_messages, args=(new_id,), daemon=True).start()
-
-    except Exception as e:
-        print(f"❌ Server error: {e}")
+    except KeyboardInterrupt:
+        pass
     finally:
-        print("🔻 Closing socket...")
-        s.close()
+        server_socket.close()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("🛑 Server stopped manually.")
-    finally:
-        print("🔻 Exiting cleanly...")
-        s.close()
+    main()
